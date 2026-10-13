@@ -12,6 +12,16 @@ This version intentionally uses lightweight dependencies:
 Tkinter + OpenCV + Pillow.
 """
 
+import os
+import sys
+
+# A --windowed exe has no console: sys.stdout / sys.stderr are None, which makes
+# torch / ultralytics crash when they print or log. Give them a harmless sink.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 import json
 import math
 import random
@@ -29,7 +39,7 @@ import numpy as np
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 
 
-APP_NAME = "IDAnnotate --by Md. Rahatul Islam"   # <- change the app name here
+APP_NAME = "IDAnnotate --Md.Rahatul Islam"   # <- change the app name here
 PROJECT_VERSION = 1
 
 # Paths work both when running the .py file and when packaged as a Windows .exe.
@@ -40,16 +50,27 @@ else:
     APP_DIR = Path(__file__).resolve().parent
     BUNDLE_DIR = APP_DIR
 
-# Logo: put "logo.png" (and optionally "logo.ico") next to the app, or use
-# View > Change Logo...
-DEFAULT_LOGO = (
-    APP_DIR / r"D:\IDAnnotate\logo.png" if (APP_DIR / r"D:\IDAnnotate\logo.png").exists()
-    else BUNDLE_DIR / r"D:\IDAnnotate\logo.png"
-)
-LOGO_ICO = (
-    APP_DIR / r"D:\IDAnnotate\logo.ico" if (APP_DIR / r"D:\IDAnnotate\logo.ico").exists()
-    else BUNDLE_DIR / r"D:\IDAnnotate\logo.ico"
-)
+# Logo: "logo.png" / "logo.ico" are bundled inside the exe (see build_windows.bat).
+# Lookup order: next to the exe/script (lets you override it) -> bundled copy
+# -> old fixed development path. Or use View > Change Logo...
+def _find_asset(name):
+    candidates = [
+        APP_DIR / name,
+        BUNDLE_DIR / name,
+        Path(sys.executable).resolve().parent / "_internal" / name,
+        Path(r"E:\IDAnnotate") / name,          # development fallback
+    ]
+    for c in candidates:
+        try:
+            if c.exists():
+                return c
+        except OSError:
+            pass
+    return BUNDLE_DIR / name                     # may not exist; callers check
+
+
+DEFAULT_LOGO = _find_asset("logo.png")
+LOGO_ICO = _find_asset("logo.ico")
 SETTINGS_FILE = APP_DIR / "rahat_settings.json"
 
 # ---------------- Theme (change colours here) ----------------
@@ -178,6 +199,12 @@ class RahatLabelStudio(tk.Tk):
         self.playing = False
         self.propagating = False
 
+        # AI auto-detect (YOLO / ultralytics) state
+        self._ai_model = None
+        self._ai_model_name = None
+        self._ai_names = {}
+        self._ai_class_ids = None      # set of model class ids to detect
+
         self.id_colors = [
             "#ff4d4d", "#4da6ff", "#35c46b", "#f2c94c",
             "#a970ff", "#ff8a3d", "#00b8a9", "#e85aad",
@@ -286,6 +313,19 @@ class RahatLabelStudio(tk.Tk):
             lightcolor=t["field"], darkcolor=t["field"], padding=4,
         )
         style.map("TEntry", bordercolor=[("focus", t["accent"])])
+        for _w in ("TCombobox", "TSpinbox"):
+            style.configure(
+                _w, fieldbackground=t["field"], foreground=t["text"],
+                background=t["btn"], arrowcolor=t["text"], insertcolor=t["text"],
+                bordercolor=t["border"], lightcolor=t["field"], darkcolor=t["field"],
+                padding=3,
+            )
+            style.map(
+                _w,
+                fieldbackground=[("readonly", t["field"])],
+                foreground=[("readonly", t["text"])],
+                bordercolor=[("focus", t["accent"])],
+            )
         style.configure(
             "Horizontal.TScale", background=t["accent"], troughcolor=t["field"],
             bordercolor=t["border"], lightcolor=t["accent"], darkcolor=t["accent"],
@@ -534,6 +574,10 @@ class RahatLabelStudio(tk.Tk):
         menubar.add_cascade(label="Annotation", menu=annotation_menu)
 
         ai_menu = tk.Menu(menubar, tearoff=False)
+        ai_menu.add_command(label="YOLO Detect - Current Frame (I)", command=self.ai_run_current)
+        ai_menu.add_command(label="YOLO Detect - Frame Range...", command=self.ai_run_all)
+        ai_menu.add_command(label="YOLO Detect - Choose Classes...", command=self.ai_choose_classes)
+        ai_menu.add_separator()
         ai_menu.add_command(label="Simple Motion Propagation", command=self.propagate_current_identity)
         ai_menu.add_command(label="OpenCV Auto-Track Selected", command=self.auto_track_selected)
         ai_menu.add_separator()
@@ -591,6 +635,71 @@ class RahatLabelStudio(tk.Tk):
 
         self.media_label = ttk.Label(top, text="No media", style="Top.TLabel")
         self.media_label.pack(side="right", padx=8)
+
+        # ---------------- AI AUTO-DETECT BAR ----------------
+        ai_bar = ttk.Frame(self, padding=(10, 4), style="Top.TFrame")
+        ai_bar.pack(fill="x")
+        self.ai_bar = ai_bar
+
+        ttk.Label(
+            ai_bar, text="AI", style="Top.TLabel",
+            font=(self.ui_family, 10, "bold"), foreground=THEME["accent2"],
+        ).pack(side="left", padx=(0, 6))
+
+        self.ai_model_var = tk.StringVar(value="yolov8s.pt")
+        ttk.Combobox(
+            ai_bar, textvariable=self.ai_model_var, width=16,
+            values=[
+                "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
+                "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt",
+            ],
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            ai_bar, text="...", width=3, style="Tool.TButton",
+            command=self.ai_browse_model,
+        ).pack(side="left", padx=2)
+
+        ttk.Button(
+            ai_bar, text="Run (I)", style="Tool.Accent.TButton",
+            command=self.ai_run_current,
+        ).pack(side="left", padx=(8, 2))
+        ttk.Button(
+            ai_bar, text="Run Range", style="Tool.TButton",
+            command=self.ai_run_all,
+        ).pack(side="left", padx=2)
+
+        ttk.Label(ai_bar, text="Confidence", style="Top.TLabel").pack(side="left", padx=(10, 3))
+        self.ai_conf_var = tk.StringVar(value="0.25")
+        ttk.Spinbox(
+            ai_bar, from_=0.01, to=1.0, increment=0.05, width=5,
+            textvariable=self.ai_conf_var, format="%.2f",
+        ).pack(side="left")
+
+        ttk.Label(ai_bar, text="IoU", style="Top.TLabel").pack(side="left", padx=(10, 3))
+        self.ai_iou_var = tk.StringVar(value="0.45")
+        ttk.Spinbox(
+            ai_bar, from_=0.01, to=1.0, increment=0.05, width=5,
+            textvariable=self.ai_iou_var, format="%.2f",
+        ).pack(side="left")
+
+        self.ai_replace = tk.BooleanVar(value=False)
+        self.ai_replace_btn = ttk.Button(
+            ai_bar, text="Replace (Off)", style="Tool.TButton",
+            command=self.ai_toggle_replace,
+        )
+        self.ai_replace_btn.pack(side="left", padx=(10, 2))
+        ttk.Button(
+            ai_bar, text="Classes", style="Tool.TButton",
+            command=self.ai_choose_classes,
+        ).pack(side="left", padx=2)
+
+        self.ai_status_var = tk.StringVar(
+            value="AI ready - pick a model and press Run (I)."
+        )
+        ttk.Label(
+            ai_bar, textvariable=self.ai_status_var, style="Top.TLabel",
+            foreground=THEME["muted"],
+        ).pack(side="left", padx=12)
 
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=6, pady=4)
@@ -851,6 +960,8 @@ class RahatLabelStudio(tk.Tk):
         self.bind("<C>", lambda e: self.copy_previous())
         self.bind("<x>", lambda e: self.clear_frame())
         self.bind("<X>", lambda e: self.clear_frame())
+        self.bind("<i>", self._ai_key)
+        self.bind("<I>", self._ai_key)
         self.bind("<Control-e>", lambda e: self.export_annotated_video())
         self.bind("<Control-E>", lambda e: self.export_annotated_video())
 
@@ -1092,13 +1203,125 @@ class RahatLabelStudio(tk.Tk):
         self.update_status()
 
     def edit_classes(self):
-        messagebox.showinfo(
-            "Classes",
-            "\n".join(
-                f"{cid}: {v['name']}"
-                for cid, v in sorted(self.classes.items())
-            )
+        """Manage semantic classes without changing project/identity data."""
+        win = tk.Toplevel(self)
+        win.title("Class Manager")
+        win.configure(bg=THEME["panel"])
+        win.transient(self)
+        win.grab_set()
+        win.geometry("430x470")
+        win.minsize(380, 400)
+
+        ttk.Label(win, text="CLASS MANAGER", style="Header.TLabel").pack(
+            anchor="w", padx=14, pady=(14, 5)
         )
+        ttk.Label(
+            win,
+            text="Add or rename labels. A class used by annotations cannot be deleted.",
+        ).pack(anchor="w", padx=14, pady=(0, 10))
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=14, pady=4)
+        lb = tk.Listbox(body, height=14, exportselection=False)
+        lb.pack(fill="both", expand=True, side="left")
+        sb = ttk.Scrollbar(body, orient="vertical", command=lb.yview)
+        sb.pack(side="right", fill="y")
+        lb.configure(yscrollcommand=sb.set)
+
+        def refresh(select_id=None):
+            lb.delete(0, "end")
+            ids = sorted(self.classes)
+            for cid in ids:
+                lb.insert("end", f"{cid}: {self.classes[cid]['name']}")
+            if select_id in ids:
+                pos = ids.index(select_id)
+                lb.selection_set(pos)
+                lb.activate(pos)
+
+        def selected_id():
+            sel = lb.curselection()
+            return sorted(self.classes)[sel[0]] if sel else None
+
+        def add_label():
+            name = simpledialog.askstring("Add class", "New class name:", parent=win)
+            if not name or not name.strip():
+                return
+            name = name.strip()
+            if any(v["name"].casefold() == name.casefold() for v in self.classes.values()):
+                messagebox.showwarning("Duplicate class", "That class already exists.", parent=win)
+                return
+            cid = max(self.classes.keys(), default=-1) + 1
+            self.classes[cid] = {"name": name}
+            self.active_class_id = cid
+            refresh(cid)
+            self.refresh_class_list()
+            self.update_status()
+
+        def rename_label():
+            cid = selected_id()
+            if cid is None:
+                messagebox.showinfo("Class Manager", "Select a class first.", parent=win)
+                return
+            old_name = self.classes[cid]["name"]
+            name = simpledialog.askstring(
+                "Rename class", f"New name for '{old_name}':",
+                initialvalue=old_name, parent=win
+            )
+            if not name or not name.strip():
+                return
+            name = name.strip()
+            if any(other_id != cid and rec["name"].casefold() == name.casefold()
+                   for other_id, rec in self.classes.items()):
+                messagebox.showwarning("Duplicate class", "That class name already exists.", parent=win)
+                return
+            self.classes[cid]["name"] = name
+            self.active_class_id = cid
+            refresh(cid)
+            self.refresh_class_list()
+            self.refresh_identity_list()
+            self.refresh_object_list()
+            self.update_info_panel()
+            self.update_status()
+
+        def delete_label():
+            cid = selected_id()
+            if cid is None:
+                messagebox.showinfo("Class Manager", "Select a class first.", parent=win)
+                return
+            used = (
+                any(int(a.get("class_id", -1)) == cid
+                    for anns in self.annotations.values() for a in anns)
+                or any(int(a.get("class_id", -1)) == cid for a in self.current_boxes)
+            )
+            if used:
+                messagebox.showwarning(
+                    "Class is in use",
+                    "This class is used by annotations. Rename it, or relabel/delete those annotations first.",
+                    parent=win,
+                )
+                return
+            if len(self.classes) <= 1:
+                messagebox.showwarning("Class Manager", "At least one class must remain.", parent=win)
+                return
+            if not messagebox.askyesno(
+                "Delete class", f"Delete class '{self.classes[cid]['name']}'?", parent=win
+            ):
+                return
+            del self.classes[cid]
+            if self.active_class_id == cid:
+                self.active_class_id = min(self.classes)
+            refresh(self.active_class_id)
+            self.refresh_class_list()
+            self.refresh_identity_list()
+            self.update_status()
+
+        actions = ttk.Frame(win)
+        actions.pack(fill="x", padx=14, pady=12)
+        ttk.Button(actions, text="+ Add", command=add_label).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="Rename", command=rename_label).pack(side="left", padx=6)
+        ttk.Button(actions, text="Delete", command=delete_label).pack(side="left", padx=6)
+        ttk.Button(actions, text="Close", command=win.destroy).pack(side="right")
+        refresh(self.active_class_id)
 
     # ============================================================
     # IDENTITY MANAGEMENT
@@ -1909,6 +2132,428 @@ class RahatLabelStudio(tk.Tk):
     # NAVIGATION
     # ============================================================
 
+    # ============================================================
+    # AI AUTO-DETECT (YOLO / ultralytics)
+    # ============================================================
+
+    def _ai_key(self, _event=None):
+        try:
+            if isinstance(self.focus_get(), (tk.Entry, ttk.Entry)):
+                return
+        except KeyError:        # combobox popdown has no widget name
+            return
+        self.ai_run_current()
+
+    def _ai_log_error(self, what):
+        """Write the full traceback to ai_error.log next to the app."""
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            with open(APP_DIR / "ai_error.log", "a", encoding="utf-8") as f:
+                f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}  {what} ---\n")
+                f.write(f"python: {sys.version}\nfrozen: {getattr(sys, 'frozen', False)}\n")
+                f.write(tb + "\n")
+        except Exception:
+            pass
+        return tb
+
+    def ai_toggle_replace(self):
+        self.ai_replace.set(not self.ai_replace.get())
+        self.ai_replace_btn.configure(
+            text=f"Replace ({'On' if self.ai_replace.get() else 'Off'})"
+        )
+
+    def ai_browse_model(self):
+        path = filedialog.askopenfilename(
+            title="Choose YOLO weights",
+            filetypes=[("YOLO weights", "*.pt *.onnx"), ("All files", "*.*")],
+        )
+        if path:
+            self.ai_model_var.set(path)
+
+    def _ai_read_float(self, var, default, lo=0.01, hi=1.0):
+        try:
+            v = float(var.get())
+        except (ValueError, tk.TclError):
+            v = default
+        v = max(lo, min(hi, v))
+        var.set(f"{v:.2f}")
+        return v
+
+    def _ai_load_model(self):
+        name = self.ai_model_var.get().strip()
+        if not name:
+            messagebox.showwarning("AI", "Choose a model first.")
+            return None
+
+        # A bare file name (e.g. "yolov8s.pt") is looked up next to the app
+        # first, so a manually downloaded model is used instead of re-downloading.
+        if not any(sep in name for sep in ("/", "\\")):
+            for base in (APP_DIR, BUNDLE_DIR, Path.cwd()):
+                cand = base / name
+                if cand.is_file():
+                    name = str(cand)
+                    break
+
+        if self._ai_model is not None and self._ai_model_name == name:
+            return self._ai_model
+
+        try:
+            from ultralytics import YOLO
+        except Exception as exc:
+            tb = self._ai_log_error("import ultralytics")
+            self.ai_status_var.set("AI library failed to load.")
+            messagebox.showerror(
+                "AI",
+                "Could not load the AI library (ultralytics / torch).\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                f"Details saved to:\n{APP_DIR / 'ai_error.log'}",
+            )
+            return None
+
+        self.ai_status_var.set(f"Loading model {name} ...")
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            model = YOLO(name)
+        except Exception as exc:
+            self.config(cursor="")
+            self._ai_log_error(f"load model {name}")
+            self.ai_status_var.set("Model failed to load.")
+            messagebox.showerror(
+                "AI",
+                f"Could not load model '{name}':\n\n{exc}\n\n"
+                f"Details saved to:\n{APP_DIR / 'ai_error.log'}",
+            )
+            return None
+        self.config(cursor="")
+
+        self._ai_model = model
+        self._ai_model_name = name
+        self._ai_names = {int(k): str(v) for k, v in dict(model.names).items()}
+
+        person = [k for k, v in self._ai_names.items() if v.lower() == "person"]
+        self._ai_class_ids = set(person) if person else set(self._ai_names)
+
+        self.ai_status_var.set("Model loaded. Ready for labeling.")
+        return model
+
+    def ai_choose_classes(self):
+        if self._ai_load_model() is None:
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Detect which classes?")
+        win.configure(bg=THEME["panel"])
+        win.transient(self)
+        win.geometry("300x460")
+
+        ttk.Label(
+            win, text="Select classes to detect", style="Header.TLabel"
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+        ttk.Label(
+            win,
+            text="Select any available model classes (not only person). For a custom 'box' class, load a YOLO model trained on box examples.",
+            wraplength=270,
+        ).pack(anchor="w", padx=10, pady=(0, 6))
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=10)
+        lb = tk.Listbox(frame, selectmode="extended", exportselection=False)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        ids = sorted(self._ai_names)
+        for cid in ids:
+            lb.insert("end", f"{cid}: {self._ai_names[cid]}")
+            if cid in (self._ai_class_ids or set()):
+                lb.selection_set("end")
+
+        def select_all():
+            lb.selection_set(0, "end")
+
+        def person_only():
+            lb.selection_clear(0, "end")
+            for i, cid in enumerate(ids):
+                if self._ai_names[cid].lower() == "person":
+                    lb.selection_set(i)
+
+        def ok():
+            chosen = {ids[i] for i in lb.curselection()}
+            if not chosen:
+                messagebox.showwarning("AI", "Select at least one class.", parent=win)
+                return
+            self._ai_class_ids = chosen
+            self.ai_status_var.set(f"Detecting {len(chosen)} class(es).")
+            win.destroy()
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=10, pady=8)
+        ttk.Button(row, text="All", command=select_all).pack(side="left", padx=2)
+        ttk.Button(row, text="Person only", command=person_only).pack(side="left", padx=2)
+        ttk.Button(row, text="OK", style="Accent.TButton", command=ok).pack(side="right", padx=2)
+
+    @staticmethod
+    def _box_iou(a, b):
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+        return inter / ua if ua > 0 else 0.0
+
+    def _ai_detect(self, frame):
+        """Run YOLO on one BGR frame -> list of {name, conf, bbox}."""
+        conf = self._ai_read_float(self.ai_conf_var, 0.25)
+        iou = self._ai_read_float(self.ai_iou_var, 0.45)
+        classes = sorted(self._ai_class_ids) if self._ai_class_ids else None
+
+        res = self._ai_model.predict(
+            frame, conf=conf, iou=iou, classes=classes, verbose=False
+        )[0]
+
+        out = []
+        if res.boxes is None or len(res.boxes) == 0:
+            return out
+
+        xyxy = res.boxes.xyxy.cpu().numpy()
+        confs = res.boxes.conf.cpu().numpy()
+        cls = res.boxes.cls.cpu().numpy().astype(int)
+        for box, c, k in zip(xyxy, confs, cls):
+            out.append({
+                "name": self._ai_names.get(int(k), str(int(k))),
+                "conf": float(c),
+                "bbox": [float(v) for v in box],
+            })
+        return out
+
+    def _ai_class_for(self, name):
+        for cid, rec in self.classes.items():
+            if rec["name"].lower() == name.lower():
+                return cid
+        cid = max(self.classes.keys(), default=-1) + 1
+        self.classes[cid] = {"name": name}
+        return cid
+
+    def _new_identity(self, class_id):
+        iid = self.next_individual_id
+        self.next_individual_id += 1
+        self.identities[iid] = {
+            "individual_id": iid,
+            "class_id": class_id,
+            "name": f"ID_{iid:03d}",
+            "notes": "",
+        }
+        return iid
+
+    def _ai_apply(self, frame_shape, dets, existing, prev, replace):
+        """Turn detections into annotations.
+
+        - Each detection inherits the Individual ID of an overlapping box
+          (this frame's old box when replacing, otherwise the previous frame),
+          so identities stay stable. Unmatched detections get a new ID.
+        - replace=False keeps existing boxes and skips duplicates of them.
+        """
+        h, w = frame_shape[:2]
+        existing = [self.deep_copy_annotation(a) for a in existing]
+
+        if replace:
+            kept = []
+            refs = existing + [self.deep_copy_annotation(a) for a in prev]
+            used_ids = set()
+        else:
+            kept = existing
+            refs = [self.deep_copy_annotation(a) for a in prev]
+            used_ids = {int(a["individual_id"]) for a in existing}
+
+        new = []
+        for d in sorted(dets, key=lambda x: -x["conf"]):
+            x1, y1, x2, y2 = d["bbox"]
+            box = [max(0.0, x1), max(0.0, y1), min(float(w), x2), min(float(h), y2)]
+            if box[2] - box[0] < 5 or box[3] - box[1] < 5:
+                continue
+
+            if not replace and any(
+                self._box_iou(box, e["bbox"]) > 0.5 for e in existing
+            ):
+                continue
+
+            cid = self._ai_class_for(d["name"])
+
+            best, best_iou = None, 0.3
+            for r in refs:
+                rid = int(r["individual_id"])
+                if rid in used_ids or int(r["class_id"]) != cid:
+                    continue
+                v = self._box_iou(box, r["bbox"])
+                if v > best_iou:
+                    best, best_iou = r, v
+
+            if best is not None:
+                iid = int(best["individual_id"])
+            else:
+                iid = self._new_identity(cid)
+            used_ids.add(iid)
+
+            if iid not in self.identities:
+                self.identities[iid] = {
+                    "individual_id": iid,
+                    "class_id": cid,
+                    "name": f"ID_{iid:03d}",
+                    "notes": "",
+                }
+                self.next_individual_id = max(self.next_individual_id, iid + 1)
+
+            new.append({
+                "class_id": cid,
+                "individual_id": iid,
+                "track_id": self.next_track_id,
+                "bbox": box,
+                "angle": 0.0,
+                "occluded": False,
+                "visibility": 1.0,
+                "confidence": d["conf"],
+            })
+            self.next_track_id += 1
+
+        return kept + new
+
+    def ai_run_current(self):
+        if self.frame_bgr is None:
+            messagebox.showinfo("AI", "Open a video or image folder first.")
+            return
+        if self._ai_load_model() is None:
+            return
+
+        self.config(cursor="watch")
+        self.ai_status_var.set("Detecting ...")
+        self.update_idletasks()
+        try:
+            dets = self._ai_detect(self.frame_bgr)
+        except Exception as exc:
+            self.config(cursor="")
+            self._ai_log_error("detect")
+            self.ai_status_var.set("Detection failed.")
+            messagebox.showerror(
+                "AI",
+                f"Detection failed:\n\n{exc}\n\n"
+                f"Details saved to:\n{APP_DIR / 'ai_error.log'}",
+            )
+            return
+        self.config(cursor="")
+
+        prev = self.annotations.get(self.frame_idx - 1, []) if self.frame_idx > 0 else []
+        self.current_boxes = self._ai_apply(
+            self.frame_bgr.shape, dets, self.current_boxes, prev,
+            self.ai_replace.get(),
+        )
+        self.selected_index = None
+        self.commit_current()
+
+        self.refresh_identity_list()
+        self.refresh_class_list()
+        self.refresh_object_list()
+        self.update_info_panel()
+        self.redraw()
+        self.update_status()
+        self.ai_status_var.set(
+            f"Detected {len(dets)} object(s). Frame now has {len(self.current_boxes)} box(es)."
+        )
+
+    def ai_run_all(self):
+        if self.frame_bgr is None or self.total_frames <= 0:
+            messagebox.showinfo("AI", "Open a video or image folder first.")
+            return
+
+        start = simpledialog.askinteger(
+            "AI Detect Range", "Start frame:",
+            initialvalue=self.frame_idx, minvalue=0,
+            maxvalue=self.total_frames - 1, parent=self,
+        )
+        if start is None:
+            return
+        end = simpledialog.askinteger(
+            "AI Detect Range", "End frame:",
+            initialvalue=min(self.total_frames - 1, start + 100),
+            minvalue=start, maxvalue=self.total_frames - 1, parent=self,
+        )
+        if end is None:
+            return
+
+        mode = "REPLACE existing boxes" if self.ai_replace.get() else "ADD to existing boxes"
+        if not messagebox.askyesno(
+            "AI Detect Range",
+            f"Run detection on frames {start} - {end}?\n\nMode: {mode}",
+            parent=self,
+        ):
+            return
+
+        if self._ai_load_model() is None:
+            return
+
+        self.commit_current()
+        self._ai_stop = False
+
+        win = tk.Toplevel(self)
+        win.title("AI detection")
+        win.configure(bg=THEME["panel"])
+        win.transient(self)
+        win.geometry("360x130")
+        win.protocol("WM_DELETE_WINDOW", lambda: setattr(self, "_ai_stop", True))
+        msg = tk.StringVar(value="Starting ...")
+        ttk.Label(win, textvariable=msg).pack(padx=14, pady=(14, 6), anchor="w")
+        bar = ttk.Progressbar(win, maximum=max(1, end - start + 1))
+        bar.pack(fill="x", padx=14)
+        ttk.Button(
+            win, text="Stop", command=lambda: setattr(self, "_ai_stop", True)
+        ).pack(pady=10)
+        win.grab_set()
+
+        total_dets = 0
+        done = 0
+        error = None
+        for idx in range(start, end + 1):
+            if self._ai_stop:
+                break
+            frame = self.read_frame(idx)
+            if frame is None:
+                continue
+            try:
+                dets = self._ai_detect(frame)
+            except Exception as exc:
+                error = exc
+                break
+            prev = self.annotations.get(idx - 1, []) if idx > 0 else []
+            self.annotations[idx] = self._ai_apply(
+                frame.shape, dets, self.annotations.get(idx, []), prev,
+                self.ai_replace.get(),
+            )
+            total_dets += len(dets)
+            done += 1
+            bar["value"] = idx - start + 1
+            msg.set(f"Frame {idx} / {end}   ({total_dets} detections)")
+            win.update()
+
+        win.grab_release()
+        win.destroy()
+
+        # Reload the visible frame from the freshly written annotations.
+        self.current_boxes = [
+            self.deep_copy_annotation(a)
+            for a in self.annotations.get(self.frame_idx, [])
+        ]
+        self.refresh_identity_list()
+        self.refresh_class_list()
+        self.show_frame(self.frame_idx)
+
+        if error is not None:
+            messagebox.showerror("AI", f"Detection stopped:\n\n{error}")
+        self.ai_status_var.set(
+            f"Range done: {done} frame(s), {total_dets} detection(s)."
+        )
+
     def prev_frame(self):
         if self.total_frames:
             self.show_frame(
@@ -2031,6 +2676,18 @@ class RahatLabelStudio(tk.Tk):
             Image.Resampling.LANCZOS
         )
 
+        # Translucent filled boxes (X-AnyLabeling style).
+        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        for obj in self.current_boxes:
+            _iid = int(obj["individual_id"])
+            _c = self.id_colors[(_iid - 1) % len(self.id_colors)]
+            _pts = [
+                (px * scale, py * scale)
+                for px, py in self.box_corners(obj["bbox"], obj.get("angle", 0.0))
+            ]
+            od.polygon(_pts, fill=(*_hex_rgb(_c), 70))   # 70 = fill opacity (0-255)
+        image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
         draw = ImageDraw.Draw(image)
 
         for i, obj in enumerate(
@@ -2076,7 +2733,7 @@ class RahatLabelStudio(tk.Tk):
             if i == self.selected_index:
                 hs = 5
                 for hx, hy in corners:
-                    draw.rectangle([hx-hs, hy-hs, hx+hs, hy+hs], fill=color, outline="white", width=1)
+                    draw.ellipse([hx-hs, hy-hs, hx+hs, hy+hs], fill=color, outline="white", width=2)
 
                 # Rotation handle: circle on a stalk above the top edge.
                 top_mid = (
@@ -2093,26 +2750,26 @@ class RahatLabelStudio(tk.Tk):
                 {"name": "unknown"}
             )["name"]
 
-            label = (
-                f"ID {iid} | {cname}"
-            )
+            label = f"id:{iid} {cname}"
+            _conf = float(obj.get("confidence", 1.0))
+            if _conf < 0.999:
+                label += f" {_conf:.2f}"
 
             try:
-                tb = draw.textbbox(
-                    (X1, Y1),
-                    label
-                )
-                draw.rectangle(
-                    tb,
-                    fill=color
-                )
-                draw.text(
-                    (X1 + 2, Y1 + 1),
-                    label,
-                    fill="white"
-                )
+                tb = draw.textbbox((0, 0), label)
+                tw, th = tb[2] - tb[0], tb[3] - tb[1]
+                ty = Y1 - th - 8
+                if ty < 0:                      # keep tag inside the image
+                    ty = Y1
+                draw.rectangle([X1, ty, X1 + tw + 10, ty + th + 8], fill=color)
+                draw.text((X1 + 5, ty + 3), label, fill="white")
             except Exception:
                 pass
+
+            # Centre marker dot.
+            _cx = sum(p[0] for p in corners) / 4.0
+            _cy = sum(p[1] for p in corners) / 4.0
+            draw.ellipse([_cx-4, _cy-4, _cx+4, _cy+4], fill="white", outline=color, width=2)
 
         # Current drawing rectangle.
         if (
@@ -3581,7 +4238,7 @@ class RahatLabelStudio(tk.Tk):
     def show_about(self):
         messagebox.showinfo(
             "About",
-            "Rahat Label Studio v2\n"
+            "IDAnnotate v1\n"
             "Developed by MD.RAHATUL ISLAM\n\n"
             "Identity-aware annotation software "
             "for detection, tracking and Re-ID datasets.\n\n"
@@ -3611,5 +4268,7 @@ class RahatLabelStudio(tk.Tk):
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     app = RahatLabelStudio()
     app.mainloop()
